@@ -36,7 +36,9 @@ int App::init(const AppConfig &cfg)
         LOGW("built without RGA, image ops fall back to OpenCV");
 
     // 1. 模型(NPU 上下文)最先初始化: 失败立即返回, 此时还没有任何线程和网络连接
-    if (models_.init(cfg_.models, use_rga, cfg_.infer.threads) != 0)
+    //    前处理的 RGA 开关独立于其它环节: 普通内存上的 RGA 不一定比 OpenCV 快, 以 <model>.pre 实测为准
+    bool pre_rga = cfg_.infer.use_rga && rga::available();
+    if (models_.init(cfg_.models, pre_rga, cfg_.infer.threads) != 0)
     {
         LOGE("model init failed");
         return -1;

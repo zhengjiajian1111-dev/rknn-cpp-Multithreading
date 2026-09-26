@@ -56,7 +56,7 @@ bool preprocess(const cv::Mat &bgr, cv::Mat &input, bool letterbox, bool &use_rg
         use_rga = false;
     }
 
-    // CPU: 先缩放再转颜色, 处理的像素更少
+    // CPU: 先缩放再转颜色(处理的像素更少); 直接写入输入缓冲的 ROI 并原地转换, 不产生临时图像
     cv::Mat dst_roi = input(roi);
     if (bgr.cols == roi.width && bgr.rows == roi.height)
     {
@@ -64,9 +64,8 @@ bool preprocess(const cv::Mat &bgr, cv::Mat &input, bool letterbox, bool &use_rg
     }
     else
     {
-        cv::Mat resized;
-        cv::resize(bgr, resized, roi.size(), 0, 0, cv::INTER_LINEAR);
-        cv::cvtColor(resized, dst_roi, cv::COLOR_BGR2RGB);
+        cv::resize(bgr, dst_roi, roi.size(), 0, 0, cv::INTER_LINEAR);
+        cv::cvtColor(dst_roi, dst_roi, cv::COLOR_BGR2RGB);
     }
     return true;
 }

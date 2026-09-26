@@ -27,9 +27,8 @@ static std::string shapeStr(const rknn_tensor_attr &attr)
     return s;
 }
 
-RknnLite::RknnLite(const ModelConfig &cfg, int instance_id, std::shared_ptr<const std::vector<std::string>> labels,
-                   bool use_rga)
-    : cfg_(cfg), instance_id_(instance_id), labels_(std::move(labels)), use_rga_(use_rga)
+RknnLite::RknnLite(const ModelConfig &cfg, int instance_id, std::shared_ptr<const std::vector<std::string>> labels)
+    : cfg_(cfg), instance_id_(instance_id), labels_(std::move(labels))
 {
     st_pre_ = PerfMonitor::instance().stat(cfg_.name + ".pre");
     st_npu_ = PerfMonitor::instance().stat(cfg_.name + ".npu");
@@ -124,6 +123,7 @@ int RknnLite::init(RknnLite *master, rknn_core_mask core_mask)
             LOGW("[%s] output %u is not int8, post-process expects an int8 quantized model", cfg_.name.c_str(), i);
         grid_hw_[i][0] = a.dims[2];
         grid_hw_[i][1] = a.dims[3];
+        out_sizes_[i] = (size_t)a.dims[0] * a.dims[1] * a.dims[2] * a.dims[3];
         out_zps_.push_back(a.zp);
         out_scales_.push_back(a.scale);
     }
@@ -153,7 +153,6 @@ int RknnLite::init(RknnLite *master, rknn_core_mask core_mask)
         LOGE("[%s] model input channel %d != 3", cfg_.name.c_str(), model_c_);
         return -1;
     }
-    input_.create(model_h_, model_w_, CV_8UC3);
 
     if (!master)
         LOGI("[%s] input %dx%dx%d, outputs %s / %s / %s, classes=%d, labels=%zu", cfg_.name.c_str(), model_w_,
@@ -163,68 +162,75 @@ int RknnLite::init(RknnLite *master, rknn_core_mask core_mask)
     return 0;
 }
 
-int RknnLite::interf(const cv::Mat &ori_img, detect_result_group_t &result)
+bool RknnLite::prepare(const cv::Mat &ori_img, InferBuffers &buf) const
+{
+    if (!ctx_ready_ || ori_img.empty())
+        return false;
+    // 前处理: BGR -> RGB + 缩放到模型输入尺寸(RGA 或 OpenCV), 写入调用方的工作区
+    ScopedTimer t(st_pre_);
+    buf.input.create(model_h_, model_w_, CV_8UC3);
+    return preprocess(ori_img, buf.input, cfg_.letterbox, buf.use_rga, buf.lb);
+}
+
+int RknnLite::run(InferBuffers &buf)
 {
     std::lock_guard<std::mutex> lock(mtx_);
-    memset(&result, 0, sizeof(result));
-    if (!ctx_ready_ || ori_img.empty())
+    if (!ctx_ready_ || buf.input.rows != model_h_ || buf.input.cols != model_w_)
         return -1;
+    ScopedTimer t(st_npu_);
 
-    // 1. 前处理: BGR -> RGB + 缩放到模型输入尺寸(RGA 或 OpenCV)
-    LetterBox lb;
+    rknn_input input;
+    memset(&input, 0, sizeof(input));
+    input.index = 0;
+    input.type = RKNN_TENSOR_UINT8;
+    input.size = model_w_ * model_h_ * model_c_;
+    input.fmt = RKNN_TENSOR_NHWC;
+    input.pass_through = 0;
+    input.buf = buf.input.data;
+    int ret = rknn_inputs_set(ctx_, io_num_.n_input, &input);
+    if (ret < 0)
     {
-        ScopedTimer t(st_pre_);
-        if (!preprocess(ori_img, input_, cfg_.letterbox, use_rga_, lb))
-            return -1;
+        LOGE("[%s#%d] rknn_inputs_set failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
+        return -1;
+    }
+    ret = rknn_run(ctx_, nullptr);
+    if (ret < 0)
+    {
+        LOGE("[%s#%d] rknn_run failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
+        return -1;
     }
 
-    rknn_input inputs[1];
-    memset(inputs, 0, sizeof(inputs));
-    inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_UINT8;
-    inputs[0].size = model_w_ * model_h_ * model_c_;
-    inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].pass_through = 0;
-    inputs[0].buf = input_.data;
-
+    // 输出直接写入工作区(is_prealloc): 归还实例后, 后处理仍可在工作区上进行
     rknn_output outputs[3];
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < 3; i++)
+    {
+        buf.outputs[i].resize(out_sizes_[i]);
+        outputs[i].index = i;
         outputs[i].want_float = 0;
-
-    // 2. NPU 推理
-    {
-        ScopedTimer t(st_npu_);
-        int ret = rknn_inputs_set(ctx_, io_num_.n_input, inputs);
-        if (ret < 0)
-        {
-            LOGE("[%s#%d] rknn_inputs_set failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
-            return -1;
-        }
-        ret = rknn_run(ctx_, nullptr);
-        if (ret < 0)
-        {
-            LOGE("[%s#%d] rknn_run failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
-            return -1;
-        }
-        ret = rknn_outputs_get(ctx_, io_num_.n_output, outputs, nullptr);
-        if (ret < 0)
-        {
-            LOGE("[%s#%d] rknn_outputs_get failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
-            return -1;
-        }
+        outputs[i].is_prealloc = 1;
+        outputs[i].buf = buf.outputs[i].data();
+        outputs[i].size = (uint32_t)out_sizes_[i];
     }
-
-    // 3. 后处理: 解码 + NMS -> detect_result_group_t
+    ret = rknn_outputs_get(ctx_, io_num_.n_output, outputs, nullptr);
+    if (ret < 0)
     {
-        ScopedTimer t(st_post_);
-        static const std::vector<std::string> kNoLabels;
-        post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, model_h_, model_w_,
-                     grid_hw_, num_classes_, cfg_.conf_thresh, cfg_.nms_thresh, lb, out_zps_, out_scales_,
-                     labels_ ? *labels_ : kNoLabels, &result);
+        LOGE("[%s#%d] rknn_outputs_get failed ret=%d", cfg_.name.c_str(), instance_id_, ret);
+        return -1;
     }
     rknn_outputs_release(ctx_, io_num_.n_output, outputs);
     return 0;
+}
+
+void RknnLite::decode(InferBuffers &buf, detect_result_group_t &result) const
+{
+    // 后处理: 解码 + NMS -> detect_result_group_t
+    ScopedTimer t(st_post_);
+    memset(&result, 0, sizeof(result));
+    static const std::vector<std::string> kNoLabels;
+    post_process(buf.outputs[0].data(), buf.outputs[1].data(), buf.outputs[2].data(), model_h_, model_w_, grid_hw_,
+                 num_classes_, cfg_.conf_thresh, cfg_.nms_thresh, buf.lb, out_zps_, out_scales_,
+                 labels_ ? *labels_ : kNoLabels, &result);
 }
 
 void RknnLite::drawResults(cv::Mat &img, const detect_result_group_t &group, const cv::Scalar &color)

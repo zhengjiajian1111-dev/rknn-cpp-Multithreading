@@ -1,5 +1,7 @@
 #include "infer/InferWorker.hpp"
 
+#include <chrono>
+
 #include "common/FpsController.hpp"
 #include "common/Logger.hpp"
 #include "common/PerfMonitor.hpp"
@@ -10,6 +12,7 @@ InferWorker::InferWorker(int channel, const InferConfig &cfg, Mbuffer *in, Mbuff
 {
     std::string p = "ch" + std::to_string(ch_);
     auto &pm = PerfMonitor::instance();
+    st_wait_frame_ = pm.stat(p + ".wait_frame");
     st_infer_ = pm.stat(p + ".infer");
     st_fusion_ = pm.stat(p + ".fusion");
     st_out_ = pm.stat(p + ".out");
@@ -41,6 +44,7 @@ void InferWorker::run()
     uint64_t last_seq = 0;
     uint64_t processed = 0;
     std::vector<detect_result_group_t> groups;
+    ModelManager::Workspace ws; // 本路专用的推理工作区(模型输入/输出缓冲), 复用避免每帧分配
     std::vector<FusedDetection> last_dets;
     int64_t last_infer_ms = 0;
     bool have_result = false;
@@ -48,12 +52,16 @@ void InferWorker::run()
     while (running_)
     {
         FrameData frame;
+        auto wait_start = std::chrono::steady_clock::now();
         if (!in_->waitNew(frame, last_seq, 200))
         {
             if (in_->closed())
                 break;
             continue;
         }
+        // 等新帧的时间: 推理计时之外的主要空闲, 偏大说明解码出帧不均匀或推理比出帧快
+        st_wait_frame_->add(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count());
         // 序号不连续 = 推理线程跟不上解码, 中间帧被 Mbuffer 覆盖丢弃
         if (last_seq != 0 && frame.seq > last_seq + 1)
             st_drop_frame_->inc(frame.seq - last_seq - 1);
@@ -76,7 +84,7 @@ void InferWorker::run()
             {
                 ScopedTimer t(st_infer_);
                 // 线程池并发提交所有模型并等待: 得到 g1..gN
-                if (models_->inferAll(frame.img, groups) != 0)
+                if (models_->inferAll(frame.img, groups, ws) != 0)
                     LOGW("ch%d: inference failed", ch_);
             }
             {

@@ -1,5 +1,7 @@
 #include "infer/ModelManager.hpp"
 
+#include <string.h>
+
 #include <exception>
 #include <future>
 
@@ -46,8 +48,9 @@ ModelManager::Lease::~Lease()
     slot_.cv.notify_one();
 }
 
-int ModelManager::init(const std::vector<ModelConfig> &models, bool use_rga, int pool_threads)
+int ModelManager::init(const std::vector<ModelConfig> &models, bool pre_rga, int pool_threads)
 {
+    pre_rga_ = pre_rga;
     int round_robin = 0;
     int total_instances = 0;
     for (const auto &cfg : models)
@@ -61,7 +64,7 @@ int ModelManager::init(const std::vector<ModelConfig> &models, bool use_rga, int
 
         for (int i = 0; i < cfg.instances; i++)
         {
-            std::unique_ptr<RknnLite> m(new RknnLite(cfg, i, labels, use_rga));
+            std::unique_ptr<RknnLite> m(new RknnLite(cfg, i, labels));
             RknnLite *master = i == 0 ? nullptr : slot->instances[0].get();
             if (m->init(master, coreMaskFromString(cfg.core, round_robin)) != 0)
             {
@@ -82,12 +85,23 @@ int ModelManager::init(const std::vector<ModelConfig> &models, bool use_rga, int
     return 0;
 }
 
-int ModelManager::runOne(Slot &slot, const cv::Mat &img, detect_result_group_t &group)
+int ModelManager::runOne(Slot &slot, const cv::Mat &img, InferBuffers &buf, detect_result_group_t &group)
 {
+    memset(&group, 0, sizeof(group)); // 失败时结果为空, 不残留上一帧的框
     try
     {
-        Lease lease(slot);
-        return lease->interf(img, group);
+        // 前后处理只用工作区和各实例相同的模型参数, 借用 master 执行即可, 不占实例
+        const RknnLite &model = *slot.instances[0];
+        if (!model.prepare(img, buf))
+            return -1;
+        {
+            // 只有 NPU 这一步借实例: 用完立即归还, 其它线程马上可以用这个核心
+            Lease lease(slot);
+            if (lease->run(buf) != 0)
+                return -1;
+        }
+        model.decode(buf, group);
+        return 0;
     }
     catch (const std::exception &e)
     {
@@ -96,14 +110,20 @@ int ModelManager::runOne(Slot &slot, const cv::Mat &img, detect_result_group_t &
     }
 }
 
-int ModelManager::inferAll(const cv::Mat &img, std::vector<detect_result_group_t> &groups)
+int ModelManager::inferAll(const cv::Mat &img, std::vector<detect_result_group_t> &groups, Workspace &ws)
 {
     groups.resize(slots_.size());
     if (slots_.empty())
         return -1;
+    if (ws.size() != slots_.size())
+    {
+        ws.assign(slots_.size(), InferBuffers());
+        for (auto &b : ws)
+            b.use_rga = pre_rga_;
+    }
     // 单模型: 直接在调用线程执行, 省去一次线程切换(多路并发靠多个推理线程)
     if (slots_.size() == 1)
-        return runOne(*slots_[0], img, groups[0]);
+        return runOne(*slots_[0], img, ws[0], groups[0]);
 
     // 多模型: 并发提交到线程池, 各模型分别占用自己绑定的 NPU 核心
     std::vector<std::future<int>> futures;
@@ -111,10 +131,11 @@ int ModelManager::inferAll(const cv::Mat &img, std::vector<detect_result_group_t
     for (size_t k = 0; k < slots_.size(); k++)
     {
         Slot *slot = slots_[k].get();
+        InferBuffers *buf = &ws[k];
         detect_result_group_t *g = &groups[k];
-        futures.push_back(pool_->submit([this, slot, g, &img]() { return runOne(*slot, img, *g); }));
+        futures.push_back(pool_->submit([this, slot, buf, g, &img]() { return runOne(*slot, img, *buf, *g); }));
     }
-    // 等待全部完成: img/groups 被任务引用, 必须全部结束才能返回
+    // 等待全部完成: img/ws/groups 被任务引用, 必须全部结束才能返回
     int ret = 0;
     for (auto &f : futures)
     {

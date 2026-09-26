@@ -39,6 +39,7 @@ private:
     WorkerThread thread_;
     std::atomic<bool> running_{false};
 
+    PerfStat *st_wait_frame_ = nullptr;
     PerfStat *st_infer_ = nullptr;
     PerfStat *st_fusion_ = nullptr;
     PerfStat *st_out_ = nullptr;

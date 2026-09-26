@@ -71,6 +71,7 @@ struct InferConfig
     int reuse_max_ms = 500;   // 复用结果的最大时效, 超过则不再绘制旧框
     bool draw_model_boxes = false; // 额外绘制每个模型的原始框(调试用)
     int threads = 0;          // 推理线程池大小, 0 = 所有模型实例数之和
+    bool use_rga = true;      // 前处理(缩放 + BGR->RGB)用 RGA; 配置里不写时跟随 [general] use_rga
 };
 
 struct FusionConfig

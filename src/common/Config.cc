@@ -177,6 +177,7 @@ bool AppConfig::loadFromFile(const std::string &path, AppConfig &cfg, std::strin
     inf.reuse_max_ms = ini.getInt("infer", "reuse_max_ms", inf.reuse_max_ms);
     inf.draw_model_boxes = ini.getBool("infer", "draw_model_boxes", inf.draw_model_boxes);
     inf.threads = ini.getInt("infer", "threads", inf.threads);
+    inf.use_rga = ini.getBool("infer", "use_rga", g.use_rga);
 
     FusionConfig &f = cfg.fusion;
     f.method = lower(ini.getString("fusion", "method", f.method));
@@ -346,8 +347,8 @@ void AppConfig::dump() const
     for (size_t i = 0; i < models.size(); i++)
         LOGI("  model[%zu] %s: %s instances=%d core=%s weight=%.2f", i, models[i].name.c_str(),
              models[i].path.c_str(), models[i].instances, models[i].core.c_str(), models[i].weight);
-    LOGI("  infer: interval=%d target_fps=%.1f; fusion: %s iou=%.2f min_votes=%d", infer.infer_interval,
-         infer.target_fps, fusion.method.c_str(), fusion.iou_thresh, fusion.min_votes);
+    LOGI("  infer: interval=%d target_fps=%.1f pre_rga=%d; fusion: %s iou=%.2f min_votes=%d", infer.infer_interval,
+         infer.target_fps, infer.use_rga, fusion.method.c_str(), fusion.iou_thresh, fusion.min_votes);
     for (auto &p : pushes)
         LOGI("  %s: %s %s source=%s", p.name.c_str(), p.type.c_str(),
              p.type == "gb28181" ? p.gb.sip_server_ip.c_str() : p.url.c_str(), p.source.c_str());

@@ -17,10 +17,11 @@
  │                         decode_put_packet / decode_get_frame / mpp_frame_get_xxx
  ├─ s3 mpp_decoder_cb      RGA(DMA-BUF) 或 拷贝 YUV + cv::cvtColor(YUV2BGR_NV12)
  │        │ 写入 Mbuffer.img  (最新帧槽, 覆盖写, 下游慢则自动丢旧帧)
- ├─ s4 rknn_infer 线程      从 Mbuffer 读 BGR 图 -> rknn_lite::interf
- │                         BGR->RGB + 缩放(RGA / cv::resize, letterbox)
- │                         rknn_inputs_set / rknn_run / rknn_outputs_get
- │                         post_process 解码 + NMS -> detect_result_group_t (g1..gN, 多模型并发)
+ ├─ s4 rknn_infer 线程      从 Mbuffer 读 BGR 图 -> rknn_lite: prepare / run / decode
+ │                         prepare: BGR->RGB + 缩放(RGA / cv::resize, letterbox)      (不占实例)
+ │                         run    : 借实例 -> rknn_inputs_set / rknn_run / rknn_outputs_get -> 还实例
+ │                         decode : post_process 解码 + NMS -> detect_result_group_t   (不占实例)
+ │                         (g1..gN, 多模型并发)
  ├─ s5 DetectionFusion     fuseDetections(g1,g2,g3,g4)
  │                         calculateIoU / weightedFusion / confidenceFusion
  │                         applyNMS -> FusedDetection[] -> drawFusedDetections(ori_img)
@@ -102,12 +103,13 @@ sudo apt install librockchip-mpp-dev        # MPP 硬件编解码(没有则自�
 * **FFmpeg → MPP**: MP4/FLV 中是 AVCC 格式, 必须经过 `h264_mp4toannexb`/`hevc_mp4toannexb` 转为 Annex-B 并带内插入 SPS/PPS 才能送给 MPP.
 * **RGA**(`common/RgaUtils.cc`): 解码输出直接用 DMA-BUF fd 做 NV12→BGR(零拷贝); 推理前处理一次 `improcess` 完成缩放 + BGR→RGB + letterbox; 编码前 BGR→NV12 直接写入 MPP buffer. 任何一步失败(对齐要求、>4G 内存等)自动回退 OpenCV 并只告警一次.
 * **RKNN 多模型并行 + 按 NPU core 绑定**(`infer/ModelManager.cc`): 每个模型第一个实例 `rknn_init`, 其余实例 `rknn_dup_context` 共享权重; `core=auto` 时所有模型的实例在 core0/1/2 上轮询 `rknn_set_core_mask`, 保证三核负载均衡; 也可指定 `0_1_2` 让大模型独占三核. 实例池保证一个上下文同一时刻只被一个线程使用, 实例数 = 该模型并发度.
+* **实例只在 NPU 阶段被占用**(`infer/ModelManager.cc` `runOne`): 一次推理拆成 前处理 → 借实例跑 NPU → 还实例 → 后处理. 前后处理只用调用方的工作区(`InferBuffers`, 每路一份)和各实例相同的模型参数, 输出由 `rknn_outputs_get` 直接写入工作区(`is_prealloc`). 如果整个过程都占着实例, 实例在做 CPU 前后处理时, 它绑定的 NPU 核心只能空等.
 
 ## 3. 实时系统优化思路
 * **跳帧推理、结果复用**: `infer_interval=N` 每 N 帧推理一次, 其余帧直接绘制最近一次融合结果; `reuse_max_ms` 限制结果时效, 避免目标离开后残留旧框. 显示/推流帧率因此不受 NPU 限制.
 * **目标帧率控制**(`common/FpsController.hpp`): 推理线程用"丢帧式" `accept()`(超出 `target_fps` 的帧直接丢弃), 拼接/推流线程用"节拍式" `wait()`; 两者都以绝对时间点累加周期, 不累积 sleep 误差, 落后过多时重新对齐而不是追帧.
 * **线程池并发提交与等待**: 同一帧对 N 个模型 `pool->submit()` 得到 N 个 `future`, 再逐个 `get()` 等待(任务引用了调用方栈上的图像, 必须全部完成才返回). 线程数 = 实例总数, 持有实例的线程不再等待其它资源, 不会死锁. 单模型时直接在推理线程执行, 省一次线程切换.
-* **性能监控与瓶颈定位**(`common/PerfMonitor.cc`): 每个阶段记录 频率 / 平均耗时 / 最大耗时 / 负载(= 频率 × 平均耗时, 即占用一个线程的比例), 负载 > 85% 的阶段会被标记为瓶颈; 同时统计各级丢帧: `chN.drop.pkt` 增长说明解码跟不上, `chN.drop.frame` 增长说明推理跟不上, `chN.drop.fps` 是目标帧率主动丢弃. 以 root 运行时还会打印 `/sys/kernel/debug/rknpu/load` 的 NPU 负载.
+* **性能监控与瓶颈定位**(`common/PerfMonitor.cc`): 每个阶段记录 频率 / 平均耗时 / 最大耗时 / 负载(= 频率 × 平均耗时, 即占用一个线程的比例), 负载 > 85% 的阶段会被标记为瓶颈; 同时统计各级丢帧: `chN.drop.pkt` 增长说明解码跟不上, `chN.drop.frame` 增长说明推理跟不上, `chN.drop.fps` 是目标帧率主动丢弃. 推理一帧的时间拆成 `chN.wait_frame`(等新帧) / `<model>.pre` / `<model>.wait`(排队借实例) / `<model>.npu` / `<model>.post`; 模型级统计是所有实例的合计, 负载超过 100% 是正常的(N 个实例最多 N×100%). 以 root 运行时还会打印 `/sys/kernel/debug/rknpu/load` 的 NPU 负载.
 
 ## 4. 检测结果融合
 * **多模型结果关联**(`fusion/DetectionFusion.cc`): 所有框按 `分数 × 模型权重` 降序, 贪心地分配给 IoU 最大且 > `iou_thresh` 的同类簇; **同一簇中每个模型最多贡献一个框**(模型内部已做过 NMS, 同一模型的两个框一定是不同目标). 簇内融合方式:
