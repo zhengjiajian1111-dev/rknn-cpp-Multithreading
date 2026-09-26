@@ -17,13 +17,15 @@ if [ ! -d "${BUILD_DIR}" ]; then
 fi
 
 cd ${BUILD_DIR}
+# 可选: -DENABLE_MPP=OFF / -DENABLE_RGA=OFF / -DMPP_ROOT=<mpp 安装目录>
 cmake ../.. -DCMAKE_SYSTEM_NAME=Linux
 make -j8
 make install
 cd -
 
-# relu版本
-cd install/rknn_yolov5_demo_Linux/ && ./rknn_yolov5_demo ./model/RK3588/yolov5s-640-640.rknn ../../720p60hz.mp4
+# 快速运行(兼容旧用法): 单模型 + 单路视频 + 本地窗口
+cd install/rknn_multi_stream_Linux/ && ./rknn_multi_stream ./model/RK3588/yolov5s-640-640.rknn ../../720p60hz.mp4
+# 多路 + 多模型融合 + 推流: 按配置文件运行
+# cd install/rknn_multi_stream_Linux/ && ./rknn_multi_stream -c config/app.ini
 # 使用摄像头
-# cd install/rknn_yolov5_demo_Linux/ && ./rknn_yolov5_demo ./model/RK3588/yolov5s-640-640.rknn 0
-
+# cd install/rknn_multi_stream_Linux/ && ./rknn_multi_stream ./model/RK3588/yolov5s-640-640.rknn 0

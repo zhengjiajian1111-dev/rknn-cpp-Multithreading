@@ -147,7 +147,8 @@ namespace dpool
             }
         }
 
-        static constexpr size_t WAIT_SECONDS = 2;
+        // 用枚举常量: 头文件被多个编译单元包含时不会产生重复定义(原 constexpr 静态成员的类外定义会 ODR 冲突)
+        enum { WAIT_SECONDS = 2 };
 
         bool quit_;
         size_t currentThreads_;
@@ -160,8 +161,6 @@ namespace dpool
         std::queue<ThreadID> finishedThreadIDs_;
         std::unordered_map<ThreadID, Thread> threads_;
     };
-
-    constexpr size_t ThreadPool::WAIT_SECONDS;
 
 } // namespace dpool
 
