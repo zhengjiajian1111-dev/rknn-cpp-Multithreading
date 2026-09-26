@@ -4,6 +4,7 @@
 * 每个环节都有 CPU 兜底(FFmpeg 软解/软编、OpenCV), 硬件接口失败时自动回退, 同一套代码也能在 PC 上编译调试
 * 最初改自 [rknpu2](https://github.com/rockchip-linux/rknpu2) 的 yolov5 demo 与 [线程池](https://github.com/senlinzhan/dpool), python 版见 [rknn-multi-threaded](https://github.com/leafqycc/rknn-multi-threaded)
 * **学习文档**: [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md) —— 全链路图解、逐段讲解、项目难点、调试方法(内存泄漏/数据竞争/死锁/崩溃/性能/流媒体)
+* **面试准备**: [interview/](interview/README.md) —— 项目介绍话术、项目深挖问答、Linux/C++ 八股、手撕代码(已测试)、踩坑故事、不足与改进、上板实测清单
 
 # 处理流程
 
