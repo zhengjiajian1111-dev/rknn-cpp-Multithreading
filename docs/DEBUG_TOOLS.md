@@ -3,16 +3,16 @@
 | 工具 | 最直观的理解 | 常用操作 |
 |---|---|---|
 | **GDB** | 暂停程序，查看某一行代码和变量 | 下断点、单步执行、查看调用栈 |
-| **strace** | 查看程序向操作系统发出的请求 | 看文件打开、网络连接、信号是否正常 |
+| **strace** | 查看程序向操作系统发出的请求（系统调用） | 看文件打开、网络连接、信号是否正常 |
 | **Valgrind** | 检查内存有没有用错、忘记释放 | 查越界、释放后使用、内存泄漏 |
 
-每个工具配一个小例子，模拟项目里真实会遇到的问题。输出都是实际运行结果，只保留了关键行。编译时加 `-g -O0`（带行号、不做优化）。
+每个工具一个小例子，对应项目里的真实问题；输出是实际运行结果，只留关键行。编译加 `-g -O0`（带行号、不优化）。
 
 ---
 
 ## 1. GDB：程序退出时卡死
 
-**场景**：程序处理完最后一帧，就是不退出。项目里对应"队列没关闭，线程一直在等数据"。
+**场景**：处理完最后一帧，程序就是不退出。
 
 **关键代码**：
 
@@ -35,18 +35,18 @@ Thread 1:
 #5  main () at hang.cc:46                  <- 主线程在 join
 
 (gdb) thread 2                             切到消费者线程
-(gdb) frame 6                              切到 consumer 那一层(编号以 bt 显示的为准)
+(gdb) frame 6                              切到 consumer 这一层(编号看 bt)
 (gdb) print stop
 $1 = true                                  <- 已经要停了, 却还睡着: 没人叫醒它
 ```
 
-**结论**：改完标志要 `cv.notify_all()`。项目里由 `close()` 负责叫醒，所以退出时"先 close 再 join"。
+**结论**：改完标志要 `cv.notify_all()`。项目里由队列的 `close()` 负责叫醒，等待也都带 200ms 超时兜底；项目真卡住时，多半停在网络、NPU 调用或死锁上，查法一样。
 
 **其它常用**：
 
 ```text
-gdb ./prog  →  break 文件:行  →  run  →  next / step  →  print 变量  →  continue
-程序崩溃时输入 bt, 从上往下找第一个自己的函数, 就是崩溃位置
+gdb ./prog  →  break 文件:行  →  run  →  next(不进函数) / step(进函数)  →  print 变量  →  continue
+崩溃后输入 bt, 从上往下第一个自己的函数就是崩溃位置
 ```
 
 <details><summary>完整代码 hang.cc</summary>
@@ -120,28 +120,28 @@ write(sv[0], "frame", 5);   // 还往这条连接写
 **排查**：
 
 ```text
-$ ./sigpipe; echo $?
+$ ./sigpipe; echo $?                             看退出码
 sending frame...
 141                                              <- 141 = 128 + 13, 被 13 号信号(SIGPIPE)杀死
 
-$ strace ./sigpipe
+$ strace ./sigpipe                               看最后做了哪些系统调用
 write(3, "frame", 5) = -1 EPIPE (Broken pipe)    <- 写失败: 对方已关闭
 --- SIGPIPE {si_signo=SIGPIPE, ...} ---          <- 内核发来 SIGPIPE
 +++ killed by SIGPIPE +++                        <- 进程被杀死
 ```
 
-**结论**：SIGPIPE 的默认处理就是直接杀死进程。修复：程序开头加 `signal(SIGPIPE, SIG_IGN);`，写失败只返回错误，由程序自己重连。项目 `main.cc` 就是这么做的。
+**结论**：程序开头加 `signal(SIGPIPE, SIG_IGN);`（项目 `main.cc` 已加）。SIGPIPE 默认直接杀死进程，忽略后写失败只返回 `EPIPE`，由程序自己重连。
 
 **其它常用**：
 
 ```text
 -f                 跟踪所有线程(多线程程序必加)
 -p <进程号>         附加到正在运行的进程
--e trace=openat    看打开了哪些文件, 找不到文件时 grep ENOENT
+-e trace=openat    看打开了哪些文件, 找不到时 grep ENOENT(文件不存在)
 -e trace=network   看网络调用, 连不上时看错误码
 ```
 
-> 拉流连不上时注意：FFmpeg 的 `connect` 先返回 `EINPROGRESS`（正在连，不是错误），真正的错误在紧跟着的 `getsockopt(... [ECONNREFUSED] ...)` 里。
+> 拉流连不上时注意：FFmpeg 的 `connect` 先返回 `EINPROGRESS`，只是"正在连"，不是错误。端口被拒时，紧跟着的 `getsockopt(... [ECONNREFUSED] ...)` 才是真正的错误；地址不通时没有 `getsockopt`，要加 `-e trace=network,poll`，会看到一直 `poll(...) = 0 (Timeout)`。
 
 <details><summary>完整代码 sigpipe.cc</summary>
 
@@ -169,7 +169,7 @@ int main()
 
 ## 3. Valgrind：内存泄漏和越界
 
-**场景**：推理出错时忘了释放输出缓冲，另外有一处数组越界。平时运行完全正常，看不出问题。
+**场景**：推理失败时忘了释放输出缓冲，还有一处数组越界；平时跑起来完全正常。
 
 **关键代码**：
 
@@ -183,7 +183,7 @@ box[4] = 0;                              // leak.cc:26  越界, 下标最大是 
 **排查**：
 
 ```text
-$ valgrind --leak-check=full ./leak
+$ valgrind --leak-check=full ./leak                        列出越界和泄漏的位置
 
 Invalid write of size 4
    at main (leak.cc:26)                                    <- 越界的那一行
@@ -194,7 +194,7 @@ Invalid write of size 4
    by main (leak.cc:17)                                    <- 从这里调进去, 没有释放
 ```
 
-**结论**：报告里还有 1 块 `possibly lost`，合起来 4 块，正好是失败的第 0、3、6、9 帧。修复后报告变成 `All heap blocks were freed` 和 `0 errors`。
+**结论**：失败分支也要 `delete[] buf`，`box` 的下标最大到 3；修好后报告为 `All heap blocks were freed`、`0 errors`。报告里另有 1 块 `possibly lost`，合计 4 块，正好是失败的第 0、3、6、9 帧。
 
 **报告关键词**：
 
@@ -205,7 +205,7 @@ still reachable       退出时还有指针指着, 一般不算泄漏
 Invalid read/write    越界, 或者用了已释放的内存
 ```
 
-> 用到项目上：程序会慢 20～50 倍，只开一路短时间跑，并且要 Ctrl+C 正常退出才有报告。MPP、RKNN 的设备内存 Valgrind 看不到，要看 `/proc/meminfo` 里的 CMA 用量。
+> 用到项目上：会慢 20～50 倍，只开一路短时间跑，Ctrl+C 正常退出后才出报告。MPP（硬件解码）、RKNN（NPU）用的是驱动分配的设备内存，Valgrind 看不到，要看系统可用内存（`/proc/meminfo` 的 `MemAvailable`）是否一直降，再用 `/sys/kernel/debug/dma_buf/bufinfo`（需要 root）看是哪类缓冲区在增加。
 
 <details><summary>完整代码 leak.cc</summary>
 
@@ -247,17 +247,17 @@ int main()
 
 ## 项目里怎么用
 
-先用 Debug 构建（默认 Release 没有行号）：`cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=Debug`
+先用 Debug 构建（默认 Release 没有行号）：在 `build/build_linux_aarch64` 里执行 `cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=Debug && make -j8 && make install`，下面的命令都在 `install/rknn_multi_stream_Linux` 里运行。调完用 `-DCMAKE_BUILD_TYPE=Release` 改回来，构建脚本不会自动改回。
 
 | 现象 | 工具 | 命令 |
 |---|---|---|
 | 退出时或运行中卡住 | GDB | `gdb -p $(pidof rknn_multi_stream)`，然后 `thread apply all bt` |
 | 段错误崩溃 | GDB | `gdb --args ./rknn_multi_stream -c config/app.ini`，`run` 到崩溃后 `bt` |
 | 进程突然消失 | strace | 先 `echo $?` 看退出码，再 `strace -f -o log.txt ./rknn_multi_stream -c ...` 看最后几行 |
-| 拉流连不上 | strace | `strace -f -e trace=network ./rknn_multi_stream -c ...`，看 `getsockopt` 里的错误码 |
-| 内存一直涨 | Valgrind | 单路短时间跑 `valgrind --leak-check=full ...`，同时看 CMA 用量 |
+| 拉流连不上 | strace | `strace -f -e trace=network,poll ./rknn_multi_stream -c ...`，被拒看 `getsockopt` 里的错误码，地址不通看 `poll(...) = 0 (Timeout)` |
+| 内存一直涨 | Valgrind | 单路短时间跑 `valgrind --leak-check=full ...`，同时看 `MemAvailable` 和 dma_buf 用量 |
 
-项目里的线程都有名字（`ch0-dec`、`ch0-infer` 等），在 GDB 的 `info threads` 里能直接认出是哪一路。
+项目自己的线程都有名字（`ch0-demux`、`ch0-dec`、`ch0-infer`、`mosaic` 等），在 GDB 的 `info threads` 里能直接认出是哪一路。看到多个同名的 `chN-infer` 时，多出来的是它创建的辅助线程（OpenCV 的并行线程、多模型时的推理线程池），各路共用。
 
 ---
 

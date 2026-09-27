@@ -457,7 +457,7 @@ MPP 解码出的图像在硬件内存里，有一个文件描述符（fd），�
 ```
 
 - **普通内存**：用 ASan（编译加 `-fsanitize=address`，正常退出时打印泄漏位置）、heaptrack、valgrind；
-- **硬件内存**：MPP/NPU 的缓冲区 ASan 查不到，要看系统的 CMA 用量，并检查每个"申请"都有对应的"释放"。例如 `rknn_outputs_get` 之后必须 `rknn_outputs_release`，漏了每帧泄漏约 2MB；
+- **硬件内存**：MPP/NPU 的缓冲区 ASan 查不到，要看 dma_buf 用量（`/sys/kernel/debug/dma_buf/bufinfo`）和系统可用内存是否一直变化，并检查每个"申请"都有对应的"释放"。例如 `rknn_outputs_get` 之后必须 `rknn_outputs_release`，漏了每帧泄漏约 2MB；
 - **缩小范围**：逐个关掉模块（关推流、关显示、只留一路），看关掉哪个之后泄漏消失。
 
 **E2 程序卡死怎么查？**

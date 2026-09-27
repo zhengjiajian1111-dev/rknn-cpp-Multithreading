@@ -1002,7 +1002,7 @@ GDB、strace、Valgrind 的上手例子见 [DEBUG_TOOLS.md](DEBUG_TOOLS.md)。
 **第三步：硬件内存单独看**
 
 MPP 的解码/编码缓冲区、NPU 的内存都不走 `malloc`，ASan、valgrind **看不到**。只能：
-- 看系统的 CMA 可用量（`/proc/meminfo` 里的 CmaFree）是否持续下降；
+- 看 `/sys/kernel/debug/dma_buf/bufinfo`（需要 root）里的缓冲区数量和总大小是否一直涨，再看系统可用内存（`/proc/meminfo` 的 `MemAvailable`）是否一直降。RK3588 上 MPP/NPU 的内存多经 IOMMU 分配，不一定来自 CMA，所以只看 `CmaFree` 可能看不出变化；
 - 检查每个"申请"都有对应的"释放"：
 
 | 资源 | 申请 | 释放 | 漏了会怎样 |
@@ -1107,7 +1107,7 @@ MPP 的解码/编码缓冲区、NPU 的内存都不走 `malloc`，ASan、valgrin
 1. **加一个 OSD 字段**：在每路画面上显示当前检测到的目标数量。
 2. **修复一个已知小问题**：实时流重连后，`StreamLoader` 会把 `first_pts_` 重置但没有更新 `pts_offset_`，导致该路帧的 pts 从 0 重新开始（推流用自己的时钟，所以不影响推流）。请让它在重连后继续单调递增。
 3. **perf 报告加内存行**：每次打印时附带 VmRSS、线程数、fd 数，方便长时间观察泄漏。
-4. **故意制造泄漏**：注释掉 `rknn_outputs_release`，用 CMA/RSS 曲线观察现象；再在 FFmpeg 路径注释掉 `av_packet_unref`，用 ASan 找出来。
+4. **故意制造泄漏**：注释掉 `rknn_outputs_release`，用 dma_buf、MemAvailable 和 RSS 的变化观察现象；再在 FFmpeg 路径注释掉 `av_packet_unref`，用 ASan 找出来。
 5. **GB28181 支持 H.265**：PSM 的 stream_type 改为 0x24，编码器改为 HEVC，注意 finalizePacket 的 NAL 类型判断也要改。
 6. **零拷贝 NPU 输入**：用 `rknn_create_mem` + `rknn_set_io_mem`，让 RGA 直接把预处理结果写进 NPU 输入内存，省掉一次拷贝。
 7. **更好的关联算法**：把贪心关联改成匈牙利匹配，对比拥挤场景下的效果。
