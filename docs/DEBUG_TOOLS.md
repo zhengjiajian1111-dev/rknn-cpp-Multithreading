@@ -1,424 +1,235 @@
-# 调试工具实战：GDB / strace / Valgrind
+# 调试工具：GDB / strace / Valgrind
 
-> 三个工具各配一个小例子，每个例子模拟本项目里真实会遇到的问题。文中的输出都是实际运行得到的，只删掉了无关的行。
-> 项目整体的调试思路见 [LEARNING_GUIDE.md 第 12 章](LEARNING_GUIDE.md#12-调试方法)。
+可以把它们理解成三种视角：
 
-## 目录
-1. [三个工具各管什么](#1-三个工具各管什么)
-2. [常用命令速查](#2-常用命令速查)
-3. [GDB：程序退出时卡死](#3-gdb程序退出时卡死)
-4. [strace：进程无声无息地退出](#4-strace进程无声无息地退出)
-5. [Valgrind：内存泄漏和越界](#5-valgrind内存泄漏和越界)
-6. [用到项目上](#6-用到项目上)
-
----
-
-## 1. 三个工具各管什么
-
-| 工具 | 什么时候用 | 它告诉你 |
+| 工具 | 最直观的理解 | 常用操作 |
 |---|---|---|
-| **GDB** | 程序崩溃、卡死 | 每个线程**停在哪一行**，变量**现在是多少** |
-| **strace** | 程序和系统打交道出错：文件打不开、网络不通、莫名其妙退出 | 程序调用了哪些**系统调用**，**返回了什么错误** |
-| **Valgrind** | 内存泄漏、越界、使用已释放的内存 | **哪一行申请的内存没释放**，**哪一行越界** |
+| **GDB** | 暂停程序，查看某一行代码和变量 | 下断点、单步执行、查看调用栈 |
+| **strace** | 查看程序向操作系统发出的请求 | 看文件打开、网络连接、设备访问是否成功 |
+| **Valgrind** | 检查内存有没有用错、忘记释放 | 查越界、释放后使用、内存泄漏 |
 
-安装：`sudo apt install gdb strace valgrind`。GDB 和 Valgrind 需要程序带调试信息，编译时加 `-g -O0`（`-g` 带上行号信息，`-O0` 关掉优化，变量不会被优化掉）。
+下面每个工具对应项目里的一个例子。**命令在 RK3588 的 Linux 终端运行，进入程序安装目录后执行。** 文中标了"实测"的输出是在 PC 上用本项目程序实际跑出来的。
+
+GDB 和 Valgrind 需要带调试信息的 Debug 构建（默认是 Release，没有行号）：
+
+```bash
+cd build/build_linux_aarch64
+cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=Debug
+make -j8 && make install
+cd ../../install/rknn_multi_stream_Linux
+```
 
 ---
 
-## 2. 常用命令速查
+## 1. GDB：暂停在解码回调，查看图像尺寸
 
-**GDB**
+**场景：解码后的画面异常（颜色错位、画面倾斜），想确认收到的宽度、高度、内存步长。**
 
-```
-gdb ./prog                       启动程序调试
-  break file.cc:20               在第 20 行打断点
-  run / continue                 运行 / 继续运行
-  next / step                    单步执行(next 不进函数, step 进函数)
-  print 变量                      看变量的值
-  bt                             看调用栈
-gdb -p <进程号>                   附加到正在运行的进程(卡死时用)
-  info threads                   列出所有线程
-  thread apply all bt            打印所有线程的调用栈
-  thread 2 / frame 6             切到 2 号线程 / 切到调用栈第 6 层
-gdb ./prog core                  打开崩溃时生成的 core 文件, 看崩溃现场
+启动调试器：
+
+```bash
+gdb --args ./rknn_multi_stream -c config/app.ini
 ```
 
-**strace**
+然后在 GDB 中依次输入：
 
-```
-strace ./prog                         打印所有系统调用
-strace -e trace=openat,connect ./prog 只看关心的系统调用
-strace -f ./prog                      跟踪所有线程(多线程程序必加)
-strace -p <进程号>                     附加到正在运行的进程
-strace -c ./prog                      统计每种系统调用的次数和耗时
-strace -tt -T -o log.txt ./prog       带时间戳和每次调用的耗时, 输出到文件
-```
-
-每一行的格式是：`系统调用(参数) = 返回值 错误码`。
-
-**Valgrind**
-
-```
-valgrind --leak-check=full ./prog
+```gdb
+break DecodeWorker::onFrame if ch_ == 0
+run
+print f.width
+print f.height
+print f.hor_stride
+print f.ver_stride
+next
+continue
 ```
 
-重点看这几个关键词：
+对应含义：
 
-| 关键词 | 含义 |
-|---|---|
-| `Invalid read` / `Invalid write` | 越界，或者用了已释放的内存 |
-| `definitely lost` | 确定泄漏 |
-| `possibly lost` | 可能泄漏，也按泄漏查 |
-| `still reachable` | 退出时还有指针指着，一般不算泄漏 |
-
-程序在 Valgrind 下会慢 20～50 倍。
-
----
-
-## 3. GDB：程序退出时卡死
-
-模拟项目里"队列没关闭，退出时卡住"：修改停止标志后，忘了唤醒正在等待的消费者。
-
-```cpp
-// hang.cc: 生产者-消费者, 退出时忘了唤醒消费者 -> 程序卡在 join
-#include <chrono>
-#include <condition_variable>
-#include <cstdio>
-#include <mutex>
-#include <queue>
-#include <thread>
-
-std::mutex mtx;
-std::condition_variable cv;
-std::queue<int> q;
-bool stop = false;
-
-void consumer()
-{
-    while (true)
-    {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [] { return !q.empty() || stop; }); // 等数据或停止
-        if (q.empty())
-            break;
-        int v = q.front();
-        q.pop();
-        lk.unlock();
-        printf("consume %d\n", v);
-    }
-}
-
-int main()
-{
-    std::thread t(consumer);
-    for (int i = 0; i < 3; i++)
-    {
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            q.push(i);
-        }
-        cv.notify_one();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        stop = true;
-    }
-    // BUG: 忘了 cv.notify_all(), 消费者一直睡在 wait 上
-    t.join();
-    printf("exit\n");
-}
+```text
+break ... if ch_ == 0  → 在解码回调处暂停, 只停第 0 路(不加条件的话 4 个解码线程都会停)
+run                    → 启动程序, 遇到断点停下
+print                  → 查看变量
+next                   → 执行下一行, 不进入被调用函数
+continue               → 继续运行, 到下一次断点再停
 ```
 
-**第 1 步：运行，现象是卡住**
+1080p 视频经 MPP 解码，典型会看到：
 
-```
-$ g++ -g -O0 -pthread hang.cc -o hang
-$ ./hang
-consume 0
-consume 1
-consume 2
-                  <- 卡在这里, 不打印 exit, 也不退出
+```text
+(gdb) print f.width
+$1 = 1920
+(gdb) print f.height
+$2 = 1080
+(gdb) print f.hor_stride
+$3 = 1920
+(gdb) print f.ver_stride
+$4 = 1088
 ```
 
-**第 2 步：另开一个终端，附加上去，看所有线程停在哪**
+**重点看 `ver_stride`：垂直步长可能大于图像高度**（这里是 1088 > 1080）。NV12 的 UV 数据从 `hor_stride × ver_stride` 开始，而不是 `width × height`，按宽高去算就会颜色错位（见 `src/decode/DecodeWorker.cc` 的 CPU 回退路径）。
 
-```
-$ gdb -p $(pidof hang)
+> PC 上走的是 FFmpeg 软解，`print f.format` 会显示 `BGR`，步长为 0；只有板子上走 MPP 才是 NV12 和上面的步长。
+
+**两点提醒**
+
+- 停在断点时，**整个程序的所有线程都暂停了**。拉实时流时对方可能因此断开，调试时用本地视频文件更方便。
+- 项目里的线程都有名字，`info threads` 能直接看出是哪一路的哪个线程（实测）：
+
+```text
 (gdb) info threads
-  Id   Target Id                              Frame
-* 1    Thread 0x7f6e2349f740 (LWP 413) "hang" __futex_abstimed_wait_common64 (...)
-  2    Thread 0x7f6e22dff6c0 (LWP 415) "hang" __futex_abstimed_wait_common64 (...)
-
-(gdb) thread apply all bt
-
-Thread 2 (Thread 0x7f6e22dff6c0 (LWP 415) "hang"):
-#0  __futex_abstimed_wait_common64 (...)          <- 前几层是系统库内部, 跳过
-#3  __pthread_cond_wait_common (...)              <- 在等条件变量
-#4  ___pthread_cond_wait (...)
-#5  std::condition_variable::wait<...> (...)
-#6  consumer () at hang.cc:19                     <- 第一个"自己的代码": 消费者睡在 cv.wait 上
-
-Thread 1 (Thread 0x7f6e2349f740 (LWP 413) "hang"):
-#0  __futex_abstimed_wait_common64 (...)
-#3  __pthread_clockjoin_ex (...)
-#4  std::thread::join() ()
-#5  main () at hang.cc:46                         <- 主线程在 join, 等消费者结束
+  Id   Target Id                             Frame
+  1    Thread ... "main"      ...
+  4    Thread ... "ch0-infer" ...
+  8    Thread ... "ch0-dec"   ...
+* 10   Thread ... "ch2-dec"   DecodeWorker::onFrame (...) at src/decode/DecodeWorker.cc:43
+  12   Thread ... "ch0-demux" ...
 ```
 
-**看调用栈的方法**：从上往下找，第一个出现你自己文件名的那一层就是关键。
+**程序崩溃**：在 GDB 里运行到崩溃，然后输入：
 
-**第 3 步：切到消费者线程，看变量**
-
-```
-(gdb) thread 2
-(gdb) frame 6
-#6  consumer () at hang.cc:19
-19          cv.wait(lk, [] { return !q.empty() || stop; }); // 等数据或停止
-(gdb) print stop
-$1 = true
-(gdb) print q
-$2 = std::queue wrapping: std::deque with 0 elements
+```gdb
+bt
 ```
 
-**结论**：`stop` 已经是 true，消费者却还睡着，说明改完标志后没有人叫醒它。
+它会显示"哪个函数调用了哪个函数"，从上往下找到第一个项目自己的函数，就是崩溃位置。
 
-**修复**：在 `stop = true` 之后加 `cv.notify_all()`。
+**程序卡住**：不用重启，直接附加到正在运行的进程上：
 
-**对应到项目**：这就是项目里 `close()` 要 `notify_all`、退出时要"先 close 再 join"的原因（见 `src/app/App.cc` 的 `App::stop`）。
-
-**程序崩溃时的用法**：
-
+```bash
+gdb -p $(pidof rknn_multi_stream)
 ```
-$ ulimit -c unlimited          允许生成 core 文件(只对当前终端有效)
-$ ./prog                       崩溃后生成 core 文件
-$ gdb ./prog core              core 文件的名字和位置由 /proc/sys/kernel/core_pattern 决定
-(gdb) bt                       直接看到崩在哪一行
+
+```gdb
+thread apply all bt
 ```
+
+它会打印每个线程停在哪。退出时卡住最常见的是某个线程睡在条件变量上（`pthread_cond_wait`），说明它在等的队列没有被关闭、没人叫醒它。
 
 ---
 
-## 4. strace：进程无声无息地退出
+## 2. strace：检查 RTSP 为什么连接不上
 
-模拟项目里"推流服务器一重启，程序直接没了，也没有任何日志"。
+**场景：项目一直打印拉流失败、反复重连。**
 
-```cpp
-// sigpipe.cc: 往对方已断开的连接写数据 -> 进程无声无息地退出
-#include <cstdio>
-#include <sys/socket.h>
-#include <unistd.h>
-
-int main()
-{
-    int sv[2];
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sv); // 一条连接的两端
-    close(sv[1]);                            // 模拟: 推流服务器断开了连接
-    fprintf(stderr, "sending frame...\n");
-    write(sv[0], "frame", 5);                // 往已断开的连接写
-    fprintf(stderr, "sent ok\n");            // 永远打印不出来
-    return 0;
-}
+```bash
+strace -f -tt -e trace=network -o net.log \
+  ./rknn_multi_stream -c config/app.ini
 ```
 
-**第 1 步：运行，现象是程序直接没了**
+参数含义：
 
-```
-$ g++ -g -O0 sigpipe.cc -o sigpipe
-$ ./sigpipe
-sending frame...
-$ echo $?
-141                          <- 退出码 141 = 128 + 13, 说明是被 13 号信号(SIGPIPE)杀死的
-```
+- `-f`：跟踪所有线程，这个项目必须加（拉流在 `chN-demux` 线程里）。
+- `-tt`：记录时间。
+- `-e trace=network`：只看网络相关的系统调用。
+- `-o net.log`：保存结果。
 
-**第 2 步：用 strace 看它最后做了什么**
+打开 `net.log`，连接被拒绝时是这样的（实测）：
 
-```
-$ strace ./sigpipe
-...                                                                   (前面是加载动态库, 跳过)
-socketpair(AF_UNIX, SOCK_STREAM, 0, [3, 4]) = 0
-close(4)                                = 0
-write(2, "sending frame...\n", 17)      = 17
-write(3, "frame", 5)                    = -1 EPIPE (Broken pipe)     <- 写失败: 对方已关闭
---- SIGPIPE {si_signo=SIGPIPE, si_code=SI_USER, ...} ---              <- 内核发来 SIGPIPE
-+++ killed by SIGPIPE +++                                             <- 进程被杀死
+```text
+18:17:10.313162 connect(3, {sa_family=AF_INET, sin_port=htons(8555), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+18:17:10.314176 getsockopt(3, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0
+18:17:10.825945 connect(3, ...) = -1 EINPROGRESS (Operation now in progress)     <- 0.5 秒后重试
+18:17:11.835123 connect(3, ...) = -1 EINPROGRESS (Operation now in progress)     <- 1 秒后重试
+18:17:13.836879 connect(3, ...) = -1 EINPROGRESS (Operation now in progress)     <- 2 秒后重试
 ```
 
-**结论**：往已断开的连接写数据，内核会发 SIGPIPE，而它的默认处理就是直接杀死进程，程序自己来不及打任何日志。
+**怎么读**：
 
-**修复**：程序开头忽略 SIGPIPE，写操作就只返回错误，由程序自己处理：
+- FFmpeg 用的是非阻塞连接：`connect` 先返回 `EINPROGRESS`，意思是"正在连"，**不是错误**。
+- 真正的结果在紧跟着的 `getsockopt` 里：`ECONNREFUSED` 表示**连接被拒绝**，应检查目标端口是否有服务在监听，以及是否有主动拒绝连接的防火墙规则。
+- 重试间隔 0.5 → 1 → 2 秒，就是项目 `StreamLoader` 的重连退避。
+- 程序日志其实已经写了 `Connection refused`。strace 更大的用处是**看清实际连的是哪个 IP 和端口**：配置写错、域名解析成了别的地址，一眼就能看出来。
 
-```cpp
-// sigpipe_fixed.cc: 忽略 SIGPIPE, 写失败时由程序自己处理
-#include <csignal>
-#include <cstdio>
-#include <sys/socket.h>
-#include <unistd.h>
+**地址不通**时又是另一种样子（实测，需要加上 `poll`：`-e trace=network,poll`）：
 
-int main()
-{
-    signal(SIGPIPE, SIG_IGN); // 修复: 忽略 SIGPIPE, 让 write 返回错误
-    int sv[2];
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sv); // 一条连接的两端
-    close(sv[1]);                            // 模拟: 推流服务器断开了连接
-    fprintf(stderr, "sending frame...\n");
-    if (write(sv[0], "frame", 5) < 0)
-        perror("write failed, reconnect later"); // 由程序自己处理: 关闭连接、稍后重连
-    return 0;
-}
+```text
+connect(3, {... sin_port=htons(554), sin_addr=inet_addr("10.255.255.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+poll([{fd=3, events=POLLOUT}], 1, 100) = 0 (Timeout)
+poll([{fd=3, events=POLLOUT}], 1, 100) = 0 (Timeout)
+...                                                    每 100ms 一次, 持续到 timeout_ms(2 秒)
 ```
 
-```
-$ g++ -g -O0 sigpipe_fixed.cc -o sigpipe_fixed
-$ ./sigpipe_fixed
-sending frame...
-write failed, reconnect later: Broken pipe
-$ echo $?
-0
-```
+对方完全不回应，最后日志里是 `Connection timed out`。应检查 IP、网段、网线和路由。
 
-**对应到项目**：`src/app/main.cc` 开头就是 `signal(SIGPIPE, SIG_IGN)`，推流写失败后关闭连接、等一会儿再重连。
+常见结果对照：
 
-**另外两个常用场景**：
+| 看到 | 含义 |
+|---|---|
+| `connect(...) = -1 EINPROGRESS` | 非阻塞连接"正在进行"，正常，看后面的结果 |
+| `getsockopt(... [ECONNREFUSED] ...)` | 端口没有服务在监听，或者被拒绝 |
+| 一直 `poll(...) = 0 (Timeout)` | 对方不回应：地址错、网络不通、被防火墙丢包 |
+| `bind(...) = -1 EADDRINUSE` | 本地端口已被占用。项目的国标模块会自动换下一个端口，出现一次不一定是问题 |
+| `recvfrom(...) = -1 EAGAIN` | 当前没有数据可读，非阻塞读的正常结果，未必是故障 |
 
-```
-# 找不到文件: 看它实际去哪个路径找模型/配置文件
-$ strace -f -e trace=openat ./rknn_multi_stream -c config/app.ini 2>&1 | grep ENOENT
-
-# 程序卡住但不确定卡在哪: 看它停在 connect / recvfrom(网络) 还是 futex(等锁或条件变量)
-$ strace -f -p <进程号>
-```
+**关键：看返回值和错误码，并结合后续调用判断，不是看到 `-1` 就认定有问题。**
 
 ---
 
-## 5. Valgrind：内存泄漏和越界
+## 3. Valgrind：检查反复重连有没有泄漏内存
 
-模拟项目里"推理出错时忘了释放输出缓冲"，再加一个数组越界。
+**场景：反复断开、恢复视频源后，程序内存不断上涨，怀疑旧的 FFmpeg 资源没有释放。**
 
-```cpp
-// leak.cc: 每帧申请输出缓冲, 出错分支忘了释放; 另有一处数组越界
-#include <cstdio>
+Valgrind 下程序会慢 20～50 倍，先准备一份**只有一路、低帧率**的配置（比如只留 `[source0]`，`[infer] target_fps = 5`），再运行：
 
-bool infer(int frame, unsigned char **out)
-{
-    *out = new unsigned char[1024 * 1024]; // 每帧 1MB 输出缓冲
-    if (frame % 3 == 0)
-        return false; // 模拟推理失败
-    return true;
-}
-
-int main()
-{
-    for (int i = 0; i < 10; i++)
-    {
-        unsigned char *buf = nullptr;
-        if (!infer(i, &buf))
-        {
-            printf("frame %d failed\n", i);
-            continue; // BUG 1: 失败分支没有 delete[] buf
-        }
-        delete[] buf;
-    }
-
-    int *box = new int[4]; // x, y, w, h
-    box[4] = 0;            // BUG 2: 越界写, 下标最大是 3
-    delete[] box;
-    return 0;
-}
+```bash
+valgrind --tool=memcheck --leak-check=full \
+  --log-file=mem.log \
+  ./rknn_multi_stream -c config/one.ini
 ```
 
-**第 1 步：直接运行，什么都看不出来**
+运行后，让视频源经历几次断线重连，再按 **Ctrl+C 正常退出**，查看 `mem.log`。一定要正常退出，`kill -9` 杀掉的话没有报告。
 
-```
-$ g++ -g -O0 leak.cc -o leak
-$ ./leak
-frame 0 failed
-frame 3 failed
-frame 6 failed
-frame 9 failed
-$ echo $?
-0                  <- 正常退出. 这类 bug 平时不报错, 只会让内存越涨越多, 或者偶尔崩溃
-```
+一路 RTSP、断开恢复 2 次后的结果（实测）：
 
-**第 2 步：用 Valgrind 跑**
-
-```
-$ valgrind --leak-check=full ./leak
-
-== Invalid write of size 4
-==    at 0x10929B: main (leak.cc:26)                          <- 第 26 行写越界
-==  Address 0x512b190 is 0 bytes after a block of size 16 alloc'd
-==    at 0x48485C3: operator new[](unsigned long) (...)
-==    by 0x10928E: main (leak.cc:25)                          <- 写到了第 25 行申请的数组后面
-
+```text
 == HEAP SUMMARY:
-==     in use at exit: 4,194,304 bytes in 4 blocks
-==   total heap usage: 13 allocs, 9 frees, 10,563,600 bytes allocated
-
-== 1,048,576 bytes in 1 blocks are possibly lost in loss record 1 of 2
-==    at 0x48485C3: operator new[](unsigned long) (...)
-==    by 0x1091C5: infer(int, unsigned char**) (leak.cc:6)
-==    by 0x109243: main (leak.cc:17)
-
-== 3,145,728 bytes in 3 blocks are definitely lost in loss record 2 of 2
-==    at 0x48485C3: operator new[](unsigned long) (...)
-==    by 0x1091C5: infer(int, unsigned char**) (leak.cc:6)    <- 泄漏的内存是在这里申请的
-==    by 0x109243: main (leak.cc:17)                          <- 从这里调用进去的
-
+==     in use at exit: 55,832 bytes in 302 blocks
+==   total heap usage: 168,546 allocs, 168,244 frees, 932,966,051 bytes allocated
 == LEAK SUMMARY:
-==    definitely lost: 3,145,728 bytes in 3 blocks
+==    definitely lost: 0 bytes in 0 blocks
 ==    indirectly lost: 0 bytes in 0 blocks
-==      possibly lost: 1,048,576 bytes in 1 blocks
-==    still reachable: 0 bytes in 0 blocks
-== ERROR SUMMARY: 3 errors from 3 contexts (suppressed: 0 from 0)
-```
-
-**怎么读这份报告**
-
-- **越界**：`0 bytes after a block of size 16`，意思是正好写到了 16 字节数组（4 个 int）末尾之后，也就是 `box[4]`。
-- **泄漏**：确定泄漏 3 块，加可能泄漏 1 块，一共 4 块，每块 1MB，正好对应失败的第 0、3、6、9 帧。
-- **找原因**：顺着调用栈 `leak.cc:6 ← leak.cc:17` 找到申请位置，再看调用方哪条路径没有释放，就能发现是失败分支少了 `delete[]`。
-
-**第 3 步：修复后再跑一次**
-
-修复：失败分支里加 `delete[] buf;`，越界的 `box[4]` 改成 `box[3]`，保存为 `leak_fixed.cc` 后重新编译。
-
-```
-$ valgrind --leak-check=full ./leak_fixed
-==     in use at exit: 0 bytes in 0 blocks
-== All heap blocks were freed -- no leaks are possible
+==      possibly lost: 0 bytes in 0 blocks
+==    still reachable: 53,816 bytes in 281 blocks
 == ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
 ```
 
-**对应到项目**
+**怎么读**：
 
-- `rknn_outputs_get` 之后必须 `rknn_outputs_release`；MPP 的缓冲区用完要马上还给解码器。
-- **Valgrind 查不到硬件内存**：MPP、RGA、NPU 用的 DMA 内存不在普通的堆上。要看 `/proc/meminfo` 里的 CMA 用量是否一直在涨。
-- 在整个项目上用 Valgrind 很慢，建议只开一路、跑一小段时间。平时更常用 ASan（编译加 `-fsanitize=address`），只慢 2 倍左右。
+- `definitely lost: 0`，没有确定泄漏；`ERROR SUMMARY: 0`，没有非法读写。
+- `still reachable` 约 53KB，是 FFmpeg、OpenCV 等库初始化后一直保留的全局数据，退出时仍有指针指着，**不是泄漏**。
+- **判断技巧**：分别断开恢复 2 次和 10 次，对比结果。真正的泄漏会随重连次数增长，库的全局数据不会。
+
+如果有泄漏，报告会像这样（**示例**）：
+
+```text
+1,024 bytes in 1 blocks are definitely lost in loss record 12 of 30
+    at malloc (...)
+    by av_malloc (...)
+    by StreamLoader::openInput() (StreamLoader.cc:...)
+```
+
+意思是：
+
+> 有 1024 字节已经找不到任何指针指向它，属于确定泄漏。沿报告中的调用栈找到分配位置，再检查对应的释放路径。
+
+在项目里，重点对照：
+
+```text
+StreamLoader::openInput()   → 打开输入、分配资源
+StreamLoader::closeInput()  → 关闭输入、释放资源
+```
+
+其它几类常见报告：
+
+```text
+Invalid read/write       → 非法读写, 可能越界或访问已释放的内存
+possibly lost            → 只找到指向内存中间的指针, 也按泄漏排查
+still reachable          → 退出时仍有指针持有内存, 不等同于确定泄漏
+```
+
+**Valgrind 的局限**：MPP、RGA、RKNN 使用的设备内存（DMA 内存）不在普通的堆上，Valgrind 看不到。这部分要看 `/proc/meminfo` 里的 CMA 用量是否一直在涨。板子上这几个库自己也可能报出不少记录，重点看调用栈里有项目自己函数的那几条。
 
 ---
 
-## 6. 用到项目上
-
-**先编译带调试信息的版本**：项目默认是 Release 编译，没有行号信息。在构建目录里重新配置：
-
-```
-$ cd build/build_linux_aarch64
-$ cmake ../.. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_BUILD_TYPE=RelWithDebInfo
-$ make -j8 && make install
-```
-
-`RelWithDebInfo` 保留优化，同时带上行号信息，速度接近正式版本。个别变量可能显示 `<optimized out>`，要看变量时换成 `Debug`。
-
-**项目里的线程都有名字**（`ch0-infer`、`ch1-dec` 之类，由 `WorkerThread` 设置），在 GDB 的 `info threads` 和 `top -H` 里能直接认出是哪一路的哪个线程。
-
-**现象 → 工具 → 命令**
-
-| 现象 | 用什么 | 命令 |
-|---|---|---|
-| 退出时卡住 / 运行中卡住 | GDB | `gdb -p <进程号>`，然后 `thread apply all bt` |
-| 程序崩溃（段错误） | GDB | `ulimit -c unlimited` 后复现，`gdb ./rknn_multi_stream core`，然后 `bt` |
-| 进程突然消失、没有日志 | strace | 先 `echo $?` 看退出码，再 `strace -f -o log.txt ./rknn_multi_stream -c ...` 看最后几行 |
-| 模型或配置文件打不开 | strace | `strace -f -e trace=openat ... 2>&1 \| grep ENOENT` |
-| 卡在网络上（拉流、推流、国标） | strace | `strace -f -p <进程号> -e trace=network` |
-| 内存一直涨 | Valgrind / ASan | 只开一路短时间跑 `valgrind --leak-check=full`；同时看 CMA 用量 |
-| 偶发崩溃、怀疑越界 | Valgrind / ASan | 同上，看 `Invalid read/write` |
+**记住这三个问题即可：GDB 查"代码执行到哪了"，strace 查"系统调用发生了什么"，Valgrind 查"内存有没有用错"。**

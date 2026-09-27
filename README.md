@@ -5,7 +5,7 @@
 * 最初改自 [rknpu2](https://github.com/rockchip-linux/rknpu2) 的 yolov5 demo 与 [线程池](https://github.com/senlinzhan/dpool), python 版见 [rknn-multi-threaded](https://github.com/leafqycc/rknn-multi-threaded)
 * **学习文档**: [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md) —— 全链路与各环节的流程图解、线程模型、难点与调试方法
 * **面试准备**: [docs/INTERVIEW_GUIDE.md](docs/INTERVIEW_GUIDE.md) —— 项目介绍、高频问题(配流程图)、基础知识、手撕代码思路、踩坑故事、不足与改进
-* **调试工具**: [docs/DEBUG_TOOLS.md](docs/DEBUG_TOOLS.md) —— GDB / strace / Valgrind 各配一个可以动手跑的例子
+* **调试工具**: [docs/DEBUG_TOOLS.md](docs/DEBUG_TOOLS.md) —— GDB / strace / Valgrind 各配一个项目里的实际例子
 
 # 处理流程
 
