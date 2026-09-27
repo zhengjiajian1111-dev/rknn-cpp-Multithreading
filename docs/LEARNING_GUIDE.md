@@ -936,6 +936,8 @@ NMS（非极大值抑制）：同一个目标往往被框出好几个框，要�
 
 ## 12. 调试方法
 
+GDB、strace、Valgrind 的上手例子见 [DEBUG_TOOLS.md](DEBUG_TOOLS.md)。
+
 ### 12.1 工具总览
 
 | 问题类型 | 首选工具 | 备注 |

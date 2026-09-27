@@ -437,6 +437,8 @@ MPP 解码出的图像在硬件内存里，有一个文件描述符（fd），�
 
 ### E. 调试
 
+> GDB、strace、Valgrind 的上手例子见 [DEBUG_TOOLS.md](DEBUG_TOOLS.md)，面试被问"用过什么调试工具"时可以直接讲里面的例子。
+
 **E1 内存泄漏怎么查？**
 
 ```
